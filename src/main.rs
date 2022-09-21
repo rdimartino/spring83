@@ -1,36 +1,44 @@
 use chrono::prelude::*;
 use chrono::{Months, NaiveDate, Utc};
-use ed25519_dalek::{Keypair, PublicKey};
+use ed25519_dalek::{Keypair, PublicKey, PUBLIC_KEY_LENGTH};
 use hex::ToHex;
-use rand::rngs::OsRng;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::channel;
+use std::sync::{Arc};
+use std::thread;
 
-fn key_suffix() -> String {
+lazy_static::lazy_static! {
+    static ref SUFFIX: Vec<u8> = {
+        let (month, year) = valid_until();
+        vec![0x3e, month, year]
+    };
+}
+
+fn valid_until() -> (u8, u8) {
     let today = Utc::today();
-    let valid_until = NaiveDate::from_ymd(today.year(), today.month(), 1)
+    let future = NaiveDate::from_ymd(today.year(), today.month(), 1)
         .checked_add_months(Months::new(24))
         .unwrap();
-    format!(
-        "83e{:02}{:02}",
-        valid_until.month(),
-        valid_until.year() % 100
+    (
+        future.month() as u8,
+        (future.year() / 10 % 10 * 16 + future.year() % 10) as u8,
     )
 }
 
 #[test]
-fn test_key_suffix() {
-    assert_eq!("83e0924", key_suffix())
+fn test_valid_until() {
+    assert_eq!((0x09, 0x24), valid_until())
 }
 
 fn is_valid(key: &PublicKey) -> bool {
     let bytes = key.as_bytes();
-    let s = bytes.encode_hex::<String>();
-    s.ends_with(&key_suffix())
+    let suffix = &bytes[PUBLIC_KEY_LENGTH - 3..];
+    suffix == &SUFFIX[..] && bytes[PUBLIC_KEY_LENGTH - 4] % 16 == 8
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::PUBLIC_KEY_LENGTH;
     use hex::FromHex;
 
     #[test]
@@ -53,13 +61,24 @@ mod tests {
 }
 
 fn main() {
-    let mut csprng = OsRng {};
-    let mut key = None;
-    while key.is_none() {
-        let keypair: Keypair = Keypair::generate(&mut csprng);
-        if is_valid(&keypair.public) {
-            key = Some(keypair)
-        }
+    let found = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = channel();
+    let mut children = vec![];
+    for _ in 0..10 {
+        let (stop, tx) = (Arc::clone(&found), tx.clone());
+        children.push(thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            while !stop.load(Ordering::Relaxed) {
+                let keypair: Keypair = Keypair::generate(&mut rng);
+                if is_valid(&keypair.public) {
+                    tx.send(keypair).unwrap();
+                }
+            }
+        }));
     }
-    println!("{:?}", key);
+
+    let key = rx.recv().unwrap();
+    found.store(false, Ordering::Relaxed);
+    _ = children.into_iter().map(|c| c.join().unwrap());
+    println!("secret: {}\npublic: {}", key.secret.encode_hex::<String>(), key.public.encode_hex::<String>());
 }
